@@ -1,0 +1,510 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage[ruled,vlined]{algorithm2e}
+\usepackage{booktabs}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+
+\hypersetup{colorlinks=false}
+
+\title{MP4-to-GIF Converter:\\Mathematical Foundations and Algorithmic Analysis}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+%============================================================================
+\section{Color Space Quantization}
+%============================================================================
+
+\subsection{Histogram Construction (Hist3D)}
+
+RGB space is quantized to a $33 \times 33 \times 33$ lattice.
+Each channel is reduced to 5-bit resolution with a $+1$ offset to reserve
+index 0 for boundary padding:
+\begin{equation}
+  b(r,g,b) = \left(\lfloor r/8 \rfloor + 1,\;
+               \lfloor g/8 \rfloor + 1,\;
+               \lfloor b/8 \rfloor + 1\right)
+             \in [1,32]^3
+\end{equation}
+
+Linear index: $i = r \cdot 33^2 + g \cdot 33 + b$.
+
+Five moment arrays are accumulated per bin~$i$:
+\begin{align}
+  w_i     &= \sum_{p \in \mathrm{bin}_i} 1
+             & &\text{(pixel count)} \\
+  m^R_i   &= \sum_{p} R_p,\quad
+  m^G_i    = \sum_{p} G_p,\quad
+  m^B_i    = \sum_{p} B_p
+             & &\text{(first moments)} \\
+  m^2_i   &= \sum_{p} (R_p^2 + G_p^2 + B_p^2)
+             & &\text{(second moment)}
+\end{align}
+
+Total memory: $5 \times 33^3 \times 4 \approx 700\,\text{KB}$
+(four \texttt{int32\_t} arrays + one \texttt{float} array).
+
+%----------------------------------------------------------------------------
+\subsection{Cumulative 3D Prefix Sums}
+
+Raw histograms are converted to cumulative form via Wu's M3d pattern.
+For each moment array $A$, the cumulative value at $(r,g,b)$ stores the
+sum over all bins $[0,r] \times [0,g] \times [0,b]$:
+\begin{equation}
+  A[r,g,b] = \sum_{r'=0}^{r} \sum_{g'=0}^{g} \sum_{b'=0}^{b}
+              A_{\mathrm{raw}}[r',g',b']
+\end{equation}
+
+Computed in $O(33^3)$ using running line and area accumulators.
+For each fixed $r$, the algorithm maintains:
+\begin{align}
+  \texttt{line}[b] &= \sum_{b'=1}^{b} A_{\mathrm{raw}}[r,g,b'] \\
+  \texttt{area}[b] &\mathrel{+}= \texttt{line}[b] \\
+  A[r,g,b] &= A[r-1,g,b] + \texttt{area}[b]
+\end{align}
+
+After this transformation, any box query uses 8-corner inclusion-exclusion.
+For box $B = [r_0, r_1] \times [g_0, g_1] \times [b_0, b_1]$:
+\begin{equation}
+  \mathrm{Vol}(B, A) = \sum_{\mathbf{s} \in \{0,1\}^3}
+    (-1)^{|\mathbf{s}|} \; A\!\left[\, r_{s_0},\, g_{s_1},\, b_{s_2} \,\right]
+\end{equation}
+
+Expanded in code as (\texttt{vol()} function):
+\begin{align}
+  \mathrm{Vol}(B, A) &= A[r_1, g_1, b_1] \notag \\
+    &\quad - A[r_1, g_1, b_0] \notag \\
+    &\quad - A[r_1, g_0, b_1] \notag \\
+    &\quad + A[r_1, g_0, b_0] \notag \\
+    &\quad - A[r_0, g_1, b_1] \notag \\
+    &\quad + A[r_0, g_1, b_0] \notag \\
+    &\quad + A[r_0, g_0, b_1] \notag \\
+    &\quad - A[r_0, g_0, b_0]
+\end{align}
+
+where $r_0, g_0, b_0$ are exclusive lower bounds and $r_1, g_1, b_1$ are
+inclusive upper bounds.
+
+%----------------------------------------------------------------------------
+\subsection{Wu's Optimal Quantization}
+
+The variance of a box $B$ is:
+\begin{equation}
+  \sigma^2(B) = \frac{M_2(B)}{w(B)}
+              - \frac{M_R(B)^2 + M_G(B)^2 + M_B(B)^2}{w(B)^2}
+\end{equation}
+
+Note: the implementation uses an equivalent unnormalized form that drops the
+$w(B)$ denominator from $M_2$ since it cancels when comparing variances:
+\begin{equation}
+  \hat{\sigma}^2(B) = M_2(B)
+    - \frac{M_R(B)^2 + M_G(B)^2 + M_B(B)^2}{w(B)}
+\end{equation}
+
+where $w(B) = \mathrm{Vol}(B, \mathbf{w})$,
+$M_c(B) = \mathrm{Vol}(B, \mathbf{m}^c)$ for $c \in \{R,G,B\}$,
+$M_2(B) = \mathrm{Vol}(B, \mathbf{m}^2)$.
+
+\medskip
+\noindent\textbf{Greedy Splitting Algorithm:}
+
+\begin{enumerate}
+  \item Initialize single box $B_0 = [0,32]^3$, compute $\sigma^2(B_0)$.
+  \item For $k = 1, \ldots, K-1$: select
+        $B^* = \arg\max_i \sigma^2(B_i)$.
+  \item For each axis $a \in \{R, G, B\}$, find the optimal cut position:
+    \begin{equation}
+      c^*_a = \arg\max_{c \in (\mathrm{lo}_a, \mathrm{hi}_a)}
+        \left[
+          \frac{M_R^2 + M_G^2 + M_B^2}{w}\bigg|_{\mathrm{bottom}(c)}
+        + \frac{M_R^2 + M_G^2 + M_B^2}{w}\bigg|_{\mathrm{top}(c)}
+        \right]
+    \end{equation}
+  \item Select axis with maximum reduction, split, recompute variances
+        for both children.
+  \item If no valid split exists (both halves have $w \leq 0$),
+        mark box as unsplittable.
+\end{enumerate}
+
+Palette extraction via weighted centroid per box:
+\begin{equation}
+  P_i = \left(
+    \frac{M_R(B_i)}{w(B_i)},\;
+    \frac{M_G(B_i)}{w(B_i)},\;
+    \frac{M_B(B_i)}{w(B_i)}
+  \right)
+\end{equation}
+
+Complexity: $O(K \cdot 33)$ per axis per split.
+Each of 3 axes scans at most 32 positions, each position evaluates
+$O(1)$ box queries. Total: $O(K \cdot 3 \cdot 32) = O(K \cdot 33)$.
+
+%----------------------------------------------------------------------------
+\subsection{Median-Cut Quantization}
+
+Priority queue ordered by pixel count $|B|$. Splitting rule: longest axis.
+
+For box $B$ with ranges $\Delta_c = c_{\max} - c_{\min}$:
+\begin{equation}
+  a^* = \arg\max_{c \in \{R,G,B\}} \Delta_c
+\end{equation}
+
+Split at median: accumulate pixel counts along $a^*$, find position $s$
+such that:
+\begin{equation}
+  \sum_{i=a_{\min}}^{s} n_i \geq \frac{|B|}{2}
+\end{equation}
+
+Two child boxes inherit the parent's bounds with:
+\begin{align}
+  B_{\mathrm{lo}}: \quad a_{\max} &\leftarrow s \\
+  B_{\mathrm{hi}}: \quad a_{\min} &\leftarrow s + 1
+\end{align}
+
+Both children are recounted by iterating over all bins in their subrange
+and pushed back onto the priority queue.
+
+Complexity: $O(K \cdot 33^3)$ worst case per split (re-scan for counting),
+$O(K \log K)$ for priority queue operations.
+
+%----------------------------------------------------------------------------
+\subsection{Inverse Color Cache (Nearest Neighbor Lookup)}
+
+A $32^3$ cache indexed by 5-bit quantized RGB (\texttt{r >> 3}, etc.).
+Initialized to sentinel value \texttt{0xFF}.
+
+Cache miss triggers brute-force $O(K)$ scan over palette with squared
+Euclidean distance:
+\begin{equation}
+  d(p, q) = (R_p - R_q)^2 + (G_p - G_q)^2 + (B_p - B_q)^2
+\end{equation}
+
+The cache is \texttt{thread\_local} to avoid synchronization.
+Amortized $O(1)$ per pixel after cache warm-up ($32^3 = 32768$ entries).
+
+%============================================================================
+\section{Dithering}
+%============================================================================
+
+\subsection{Floyd-Steinberg Error Diffusion}
+
+For pixel $(x, y)$ with quantization error
+$\mathbf{e} = \mathbf{c}_{\mathrm{in}} - \mathbf{c}_{\mathrm{palette}}$,
+error is diffused to four neighbors.
+
+Kernel matrix (forward scan, left-to-right):
+\begin{equation}
+  \frac{1}{16}\begin{bmatrix}
+    \cdot & \cdot & \cdot \\
+    \cdot &   *   &   7   \\
+      3   &   5   &   1
+  \end{bmatrix}
+\end{equation}
+
+Error propagation equations:
+\begin{align}
+  \mathbf{c}(x+1, y)   &\mathrel{+}= \tfrac{7}{16}\,\mathbf{e} \\
+  \mathbf{c}(x-1, y+1) &\mathrel{+}= \tfrac{3}{16}\,\mathbf{e} \\
+  \mathbf{c}(x,   y+1) &\mathrel{+}= \tfrac{5}{16}\,\mathbf{e} \\
+  \mathbf{c}(x+1, y+1) &\mathrel{+}= \tfrac{1}{16}\,\mathbf{e}
+\end{align}
+
+\textbf{Serpentine scanning:} direction alternates per row.
+On even rows ($y \bmod 2 = 0$): left-to-right.
+On odd rows: right-to-left with mirrored kernel (forward/backward
+neighbor roles swap).
+
+Implementation uses \texttt{int16\_t} working buffer to handle negative
+error accumulation. Values are clamped to $[0, 255]$ before palette lookup.
+
+Complexity: $O(W \times H)$ per frame, constant factor per pixel.
+
+%----------------------------------------------------------------------------
+\subsection{Bayer Ordered Dithering}
+
+Recursive construction of $n \times n$ Bayer matrix ($n = 2^k$):
+\begin{equation}
+  M_1 = \begin{bmatrix} 0 \end{bmatrix}, \quad
+  M_{2n} = \begin{bmatrix}
+    4M_n + 0 & 4M_n + 2 \\
+    4M_n + 3 & 4M_n + 1
+  \end{bmatrix}
+\end{equation}
+
+The $8 \times 8$ threshold matrix used in the implementation:
+\begin{equation}
+  M_8 = \begin{bmatrix}
+     0 & 32 &  8 & 40 &  2 & 34 & 10 & 42 \\
+    48 & 16 & 56 & 24 & 50 & 18 & 58 & 26 \\
+    12 & 44 &  4 & 36 & 14 & 46 &  6 & 38 \\
+    60 & 28 & 52 & 20 & 62 & 30 & 54 & 22 \\
+     3 & 35 & 11 & 43 &  1 & 33 &  9 & 41 \\
+    51 & 19 & 59 & 27 & 49 & 17 & 57 & 25 \\
+    15 & 47 &  7 & 39 & 13 & 45 &  5 & 37 \\
+    63 & 31 & 55 & 23 & 61 & 29 & 53 & 21
+  \end{bmatrix}
+\end{equation}
+
+Threshold application with configurable spread $s$ (default $s = 48$):
+\begin{equation}
+  \mathbf{c}'(x,y) = \mathrm{clamp}\!\left(
+    \mathbf{c}(x,y) + \frac{(M_8[y \bmod 8][x \bmod 8] - 32) \cdot s}{64},\;
+    0,\; 255
+  \right)
+\end{equation}
+
+Then nearest-palette lookup on $\mathbf{c}'$.
+
+Complexity: $O(W \times H)$ per frame, no inter-pixel dependencies
+(parallelizable).
+
+%============================================================================
+\section{GIF Encoding}
+%============================================================================
+
+\subsection{Timing Model}
+
+Video frame timestamps are expressed in stream \texttt{time\_base} units.
+Conversion to microseconds:
+\begin{equation}
+  t_{\mu\mathrm{s}} = \mathrm{pts} \times
+    \frac{\mathrm{tb.num}}{\mathrm{tb.den}} \times 10^6
+\end{equation}
+
+Implemented via \texttt{av\_rescale\_q(next\_pts - pts, tb, \{1, 1000000\})}.
+
+GIF delays are specified in centiseconds (10\,ms units).
+A drift-free accumulator converts microsecond durations to centisecond
+delays:
+\begin{align}
+  \mathrm{acc}_{\mu\mathrm{s}} &\mathrel{+}= \Delta t_{\mu\mathrm{s}} \\
+  \mathrm{cs}_{\mathrm{total}} &= \left\lfloor
+    \frac{\mathrm{acc}_{\mu\mathrm{s}} + 5000}{10000}
+  \right\rfloor
+\end{align}
+
+Emitted delay:
+\begin{equation}
+  \mathrm{cs}_{\mathrm{emit}} = \mathrm{cs}_{\mathrm{total}}
+    - \mathrm{cs}_{\mathrm{prev}}, \quad
+  \mathrm{cs}_{\mathrm{emit}} \geq 2
+\end{equation}
+
+Minimum 2\,cs enforced: browsers interpret $< 2$\,cs delays as 100\,ms.
+
+The accumulator tracks total emitted microseconds separately
+(\texttt{emit\_us}) to prevent drift between the video clock and the GIF
+clock across many frames.
+
+%----------------------------------------------------------------------------
+\subsection{Frame Skipping (FPS Control)}
+
+Minimum PTS interval for target FPS:
+\begin{equation}
+  \mathrm{pts\_step} = \left\lfloor
+    \frac{1}{\mathrm{fps}_{\mathrm{target}} \times \mathrm{tb\_seconds}}
+  \right\rfloor
+\end{equation}
+
+where $\mathrm{tb\_seconds} = \mathrm{tb.num} / \mathrm{tb.den}$.
+
+Frame accepted iff $\mathrm{pts} - \mathrm{pts}_{\mathrm{last}} \geq
+\mathrm{pts\_step}$.
+
+%============================================================================
+\section{RAII Resource Management}
+%============================================================================
+
+Template deleters for FFmpeg types. Two patterns:
+\begin{itemize}
+  \item $\mathrm{Deleter}\langle f \rangle$: calls $f(p)$ for
+        single-pointer free functions (e.g., \texttt{sws\_freeContext}).
+  \item $\mathrm{Deleterp}\langle f \rangle$: calls $f(\&p)$ for
+        double-pointer free functions (e.g., \texttt{avformat\_close\_input}).
+\end{itemize}
+
+Type aliases, all via \texttt{std::unique\_ptr}:
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+  Alias & FFmpeg Type & Deleter \\
+\midrule
+  \texttt{FormatCtx} & \texttt{AVFormatContext} &
+    $\mathrm{Deleterp}\langle\texttt{avformat\_close\_input}\rangle$ \\
+  \texttt{CodecCtx} & \texttt{AVCodecContext} &
+    $\mathrm{Deleterp}\langle\texttt{avcodec\_free\_context}\rangle$ \\
+  \texttt{Frame} & \texttt{AVFrame} &
+    $\mathrm{Deleterp}\langle\texttt{av\_frame\_free}\rangle$ \\
+  \texttt{Packet} & \texttt{AVPacket} &
+    $\mathrm{Deleterp}\langle\texttt{av\_packet\_free}\rangle$ \\
+  \texttt{SwsCtx} & \texttt{SwsContext} &
+    $\mathrm{Deleter}\langle\texttt{sws\_freeContext}\rangle$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Error handling: \texttt{av\_check(r, msg)} throws \texttt{PipelineError}
+(inherits \texttt{std::runtime\_error}) on any negative FFmpeg return code.
+
+%============================================================================
+\section{Two-Pass Pipeline Architecture}
+%============================================================================
+
+\begin{description}
+  \item[Pass 1:] Demux $\to$ Decode $\to$ Scale $\to$ Histogram
+    accumulation
+  \item[Pass 2:] Seek(0) $\to$ Demux $\to$ Decode $\to$ Scale $\to$
+    Dither $\to$ GIF encode
+\end{description}
+
+Between passes:
+\begin{enumerate}
+  \item Palette generated from accumulated histogram
+        (Wu or median-cut, selected via \texttt{Cfg::quant}).
+  \item Stream seeked to start via \texttt{seek\_start()}.
+  \item Decoder flushed via \texttt{avcodec\_flush\_buffers()}.
+  \item Inverse color cache reset.
+  \item Scaler \texttt{src\_w} zeroed to force \texttt{SwsContext}
+        re-creation.
+\end{enumerate}
+
+One-frame-behind buffering: each frame's GIF delay requires knowledge of
+the next frame's PTS, so the current frame is buffered and written when
+the next frame arrives. The last frame uses the previous inter-frame
+duration as fallback (30\,fps default if only one frame decoded).
+
+\bigskip
+\noindent\textbf{Module Dependency Graph:}
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=1.5cm and 2.2cm,
+  every node/.style={
+    draw, rectangle, minimum height=0.7cm, minimum width=1.8cm,
+    font=\small\ttfamily
+  },
+  arr/.style={-{Stealth[length=3mm]}, thick},
+  group/.style={draw=gray, dashed, rounded corners, inner sep=0.3cm}
+]
+  % ffmpeg layer
+  \node (ff) {ff\_types};
+  \node (dmx) [right=of ff] {demuxer};
+  \node (dec) [right=of dmx] {decoder};
+  \node (scl) [right=of dec] {scaler};
+
+  % quant layer
+  \node (hist) [below=2cm of ff] {histogram};
+  \node (pal)  [right=of hist] {palette};
+  \node (wu)   [right=of pal] {wu\_quant};
+  \node (mc)   [right=of wu] {median\_cut};
+
+  % dither layer
+  \node (dit)  [below=2cm of hist] {dither};
+
+  % gif layer
+  \node (gif)  [below=2cm of pal] {gif\_enc};
+
+  % cli layer
+  \node (args) [below=2cm of wu] {args};
+
+  % pipeline layer
+  \node (conv) [below=2cm of mc] {convert};
+
+  % main
+  \node (main) [below=1.5cm of gif] {main};
+
+  % gui
+  \node (gui)  [right=of main] {gui};
+
+  % Dependencies
+  \draw[arr] (dmx) -- (ff);
+  \draw[arr] (dec) -- (ff);
+  \draw[arr] (scl) -- (ff);
+
+  \draw[arr] (wu) -- (hist);
+  \draw[arr] (wu) -- (pal);
+  \draw[arr] (mc) -- (hist);
+  \draw[arr] (mc) -- (pal);
+
+  \draw[arr] (dit) -- (pal);
+  \draw[arr] (gif) -- (pal);
+  \draw[arr] (gif) -- (ff);
+
+  \draw[arr] (args) -- (dit);
+
+  \draw[arr] (conv) -- (args);
+  \draw[arr] (conv) -- (dmx);
+  \draw[arr] (conv) -- (dec);
+  \draw[arr] (conv) -- (scl);
+  \draw[arr] (conv) -- (hist);
+  \draw[arr] (conv) -- (pal);
+  \draw[arr] (conv) -- (wu);
+  \draw[arr] (conv) -- (mc);
+  \draw[arr] (conv) -- (dit);
+  \draw[arr] (conv) -- (gif);
+
+  \draw[arr] (main) -- (conv);
+  \draw[arr] (main) -- (args);
+
+  \draw[arr] (gui) -- (conv);
+
+  % Group labels
+  \node[group, fit=(ff)(dmx)(dec)(scl),
+        label={[font=\footnotesize\sffamily]above:ffmpeg/}] {};
+  \node[group, fit=(hist)(pal)(wu)(mc),
+        label={[font=\footnotesize\sffamily]above:quant/}] {};
+\end{tikzpicture}
+\end{center}
+
+%============================================================================
+\section{Complexity Summary}
+%============================================================================
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+  Algorithm & Time & Space & Notes \\
+\midrule
+  Histogram build &
+    $O(N)$ & $O(33^3)$ &
+    $N$ = total pixels across all frames \\
+  Prefix sums &
+    $O(33^3)$ & in-place &
+    Single pass \\
+  Wu split ($K$ colors) &
+    $O(K \cdot 33)$ & $O(K)$ &
+    Per-axis scan \\
+  Wu total &
+    $O(N + K \cdot 33^3)$ & $O(33^3)$ &
+    Dominated by histogram \\
+  Median-cut &
+    $O(K \cdot 33^3 + K \log K)$ & $O(K)$ &
+    PQ + recount \\
+  Nearest lookup &
+    amortized $O(1)$ & $O(32^3)$ &
+    Cache: 32\,KB \\
+  Floyd-Steinberg &
+    $O(WH)$/frame & $O(WH)$ &
+    \texttt{int16} buffer \\
+  Bayer &
+    $O(WH)$/frame & $O(1)$ &
+    No buffer \\
+  GIF timing &
+    $O(1)$/frame & $O(1)$ &
+    Accumulator \\
+  Full pipeline &
+    $O(F \cdot WH + 33^3)$ & $O(WH + 33^3)$ &
+    $F$ = frame count \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
